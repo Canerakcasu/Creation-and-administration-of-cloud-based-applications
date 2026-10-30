@@ -1,0 +1,146 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CACBA2026 Development Environment'
+
+Parameters:
+    InstanceType:
+        Description: EC2 instance type
+        Type: String
+        Default: t3.micro
+        AllowedValues: [t3.micro, t3.small, t3.medium]
+
+    DiskSize:
+        Type: Number
+        Default: 12
+        MinValue: 10
+        MaxValue: 20
+        Description: Root volume size in GB
+
+Resources:
+
+    DevServerSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: Allow SSH and HTTP
+            SecurityGroupIngress:
+                - IpProtocol: tcp
+                  FromPort: 22
+                  ToPort: 22
+                  CidrIp: 0.0.0.0/0
+                - IpProtocol: tcp
+                  FromPort: 8080
+                  ToPort: 8080
+                  CidrIp: 0.0.0.0/0
+                - IpProtocol: tcp
+                  FromPort: 5000
+                  ToPort: 5000
+                  CidrIp: 0.0.0.0/0
+
+    DevServer:
+        Type: AWS::EC2::Instance
+        Properties:
+            InstanceType: !Ref InstanceType
+            IamInstanceProfile : LabInstanceProfile
+            KeyName: vockey
+            ImageId: ami-0b6d9d3d33ba97d99  # Ubuntu Server 26.04 (us-east-1)
+            SecurityGroups:
+                - !Ref DevServerSecurityGroup
+            Tags:
+                - Key: Name
+                  Value: devserver
+            BlockDeviceMappings:
+                - DeviceName: /dev/sda1
+                  Ebs:
+                      VolumeSize: !Ref DiskSize
+                      VolumeType: gp3
+                      Encrypted: true
+                      DeleteOnTermination: true
+            UserData:
+                Fn::Base64: |
+                    #!/bin/bash
+
+                    # Configure swap
+                    fallocate -l 2G /swapfile
+                    chmod 600 /swapfile
+                    mkswap /swapfile
+                    swapon /swapfile
+                    echo '/swapfile none swap sw 0 0' >> /etc/fstab
+                    
+                    # Add Docker's official GPG key:
+                    apt update
+                    apt install -y ca-certificates curl wget curl git libstdc++6 libc6 libssl-dev unzip zip tar build-essential python3-pip python3-venv python3-dev
+                    install -m 0755 -d /etc/apt/keyrings
+                    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+                    chmod a+r /etc/apt/keyrings/docker.asc
+
+                    # Add the Docker repository to Apt sources:
+                    tee /etc/apt/sources.list.d/docker.sources <<EOF
+                    Types: deb
+                    URIs: https://download.docker.com/linux/ubuntu
+                    Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+                    Components: stable
+                    Architectures: $(dpkg --print-architecture)
+                    Signed-By: /etc/apt/keyrings/docker.asc
+                    EOF
+
+                    # Install Docker Engine
+                    apt update
+                    apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+                    systemctl enable --now docker.service
+
+                    # Allow user ubuntu to run docker command
+                    usermod -aG docker ubuntu
+
+                    # Install AWS CLI
+                    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                    unzip awscliv2.zip
+                    ./aws/install
+                    rm awscliv2.zip
+                    rm -rf ./aws
+
+
+                    # Configure project folder
+                    su - ubuntu << 'EOF'
+                    set -euo pipefail
+                    mkdir ~/projects
+                    mkdir ~/.aws
+                    echo -e "[default]\nregion = us-east-1\noutput = yaml" >> ~/.aws/config
+                    EOF
+
+                    # Prevent SSH disconnect timeouts
+                    echo "ClientAliveInterval 60" >> /etc/ssh/sshd_config
+                    echo "ClientAliveCountMax 120" >> /etc/ssh/sshd_config
+                    systemctl restart sshd
+
+                    # Install In-Browser VS Code
+                    # We must set HOME for installer to work correctly. UserData does not set HOME for the root user.
+                    export HOME=/home/ubuntu
+                    curl -fsSL https://code-server.dev/install.sh | sh -s --
+                    systemctl enable --now code-server@ubuntu
+                    sleep 5
+                    su - ubuntu -c "sed -i 's/bind-addr: .*/bind-addr: 0.0.0.0:8080/' /home/ubuntu/.config/code-server/config.yaml"
+                    systemctl restart code-server@ubuntu
+                    # End of config
+
+    DevServerEIP:
+        Type: AWS::EC2::EIP
+        Properties:
+            Domain: vpc
+            Tags:
+                - Key: Name
+                  Value: devserver-eip
+
+    DevServerEIPAssociation:
+        Type: AWS::EC2::EIPAssociation
+        Properties:
+            InstanceId: !Ref DevServer
+            EIP: !Ref DevServerEIP
+
+Outputs:
+    PublicIP:
+        Description: Public IP address of the dev server
+        Value: !GetAtt DevServer.PublicIp
+
+    SSHCommand:
+        Description: SSH connection command
+        Value: !Sub 'ssh -i labsuser.pem ubuntu@${DevServer.PublicIp}'
